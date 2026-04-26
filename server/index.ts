@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { scrape, type ScrapeRequest, type ScrapeEvent } from './browser-service.js';
+import { scrape, type ScrapeRequest, type ScrapeEvent, type ScrapeResult } from './browser-service.js';
 
 const app = express();
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:4173'] }));
@@ -12,9 +12,11 @@ interface TaskBus {
   emitter: EventEmitter;
   /** Events emitted before an SSE client connected — flushed on connect */
   preBuffer: ScrapeEvent[];
-  /** True once an SSE client has connected — new events go directly to emitter */
+  /** True once an SSE client has connected */
   sseConnected: boolean;
   done: boolean;
+  /** Cached final result so /api/result can serve it without SSE */
+  cachedResult?: ScrapeResult | { error: string };
 }
 
 const tasks = new Map<string, TaskBus>();
@@ -49,12 +51,12 @@ app.post('/api/scrape', (req, res) => {
 
   const emit = (event: ScrapeEvent): void => {
     if (!bus.sseConnected) {
-      // SSE client not yet connected — buffer the event
       bus.preBuffer.push(event);
     }
-    // Always emit so live SSE listeners receive it
     bus.emitter.emit('event', event);
     if (event.type === 'result' || event.type === 'error') {
+      if (event.type === 'result' && event.data) bus.cachedResult = event.data;
+      if (event.type === 'error') bus.cachedResult = { error: event.error ?? 'Unknown error' };
       bus.done = true;
       bus.emitter.emit('done');
     }
@@ -65,9 +67,27 @@ app.post('/api/scrape', (req, res) => {
   });
 });
 
+// GET /api/result/:taskId — poll for final result (fallback when SSE is unreliable)
+app.get('/api/result/:taskId', (req, res) => {
+  const { taskId } = req.params as { taskId: string };
+  const bus = tasks.get(taskId);
+  if (!bus) {
+    res.status(404).json({ error: 'Task not found or expired' });
+    return;
+  }
+  if (!bus.done) {
+    res.status(202).json({ status: 'pending' });
+    return;
+  }
+  res.json(bus.cachedResult);
+});
+
 // GET /api/events/:taskId — SSE stream
 app.get('/api/events/:taskId', (req, res) => {
   const { taskId } = req.params as { taskId: string };
+
+  // Disable Nagle's algorithm so each write is flushed immediately
+  req.socket?.setNoDelay(true);
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -97,7 +117,6 @@ app.get('/api/events/:taskId', (req, res) => {
 
   // Never call res.end() from the server — the client calls es.close() after
   // receiving result/error, which closes the TCP connection cleanly.
-  // This prevents the FIN arriving before onmessage fires in the browser.
   req.on('close', () => {
     bus.emitter.off('event', onEvent);
   });

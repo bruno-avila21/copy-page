@@ -72,6 +72,32 @@ export default function App() {
         // Flag: we handled termination via a message — onerror after this is just server-side res.end()
         let resolved = false;
 
+        /** Poll /api/result once SSE closes without delivering a result. */
+        const pollResult = async (): Promise<void> => {
+          for (let i = 0; i < 8; i++) {
+            await new Promise<void>((r) => setTimeout(r, 500 + i * 300));
+            try {
+              const pr = await fetch(`${SERVER}/api/result/${taskId}`);
+              if (pr.status === 202) continue; // still pending
+              if (!pr.ok) break;
+              const payload = await pr.json() as ScrapeResult | { error: string };
+              if ('error' in payload) {
+                setError(payload.error);
+                setStatus('error');
+              } else {
+                setResult(payload);
+                setStatus(payload.botDetected ? 'bot-blocked' : 'success');
+              }
+              resolved = true;
+            } catch { /* network error, keep retrying */ }
+            if (resolved) break;
+          }
+          if (!resolved) {
+            setError('Connection lost to server — make sure the server is running (pnpm dev:server)');
+            setStatus('error');
+          }
+        };
+
         es.onmessage = (ev) => {
           const event = JSON.parse(ev.data as string) as {
             type: 'log' | 'result' | 'error';
@@ -99,9 +125,9 @@ export default function App() {
         es.onerror = () => {
           // Ignore close events that fire after we already received a result/error
           if (resolved) return;
-          setError('Connection lost to server — make sure the server is running (pnpm dev:server)');
-          setStatus('error');
           es.close();
+          // SSE closed before result arrived — fall back to polling
+          void pollResult();
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

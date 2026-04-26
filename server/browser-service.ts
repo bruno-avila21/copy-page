@@ -73,6 +73,45 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function countWords(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+/** Scroll the full page height to trigger lazy-loaded content. */
+async function scrollPage(page: import('playwright').Page): Promise<void> {
+  await page.evaluate(() =>
+    new Promise<void>((resolve) => {
+      let scrolled = 0;
+      const step = () => {
+        scrolled += 400;
+        window.scrollTo(0, scrolled);
+        if (scrolled < document.body.scrollHeight) {
+          setTimeout(step, 100);
+        } else {
+          window.scrollTo(0, 0);
+          resolve();
+        }
+      };
+      step();
+    }),
+  );
+}
+
+/**
+ * Extract clean body HTML from the live rendered DOM.
+ * Removes scripts, styles, noscript, iframes and template elements.
+ * Returns innerHTML so Turndown can convert it.
+ */
+async function extractCleanHtml(page: import('playwright').Page): Promise<string> {
+  return page.evaluate(() => {
+    const clone = document.body.cloneNode(true) as HTMLElement;
+    clone
+      .querySelectorAll('script,style,noscript,iframe,template,link[rel="stylesheet"]')
+      .forEach((el) => el.remove());
+    return clone.innerHTML;
+  });
+}
+
 export async function scrape(req: ScrapeRequest, emit: Emit): Promise<void> {
   const t0 = Date.now();
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)] as string;
@@ -140,9 +179,14 @@ export async function scrape(req: ScrapeRequest, emit: Emit): Promise<void> {
           await page.waitForSelector(req.waitFor, { timeout: req.timeout ?? 30_000 });
         }
 
-        log(emit, 'info', 'Page loaded — extracting content…');
+        log(emit, 'info', 'Page loaded — scrolling to reveal lazy content…');
+        await scrollPage(page);
+        await sleep(600);
+
+        log(emit, 'info', 'Extracting content…');
 
         const html = await page.content();
+        const cleanBodyHtml = await extractCleanHtml(page);
         const pageTitle = await page.title();
         const finalUrl = page.url();
 
@@ -165,15 +209,29 @@ export async function scrape(req: ScrapeRequest, emit: Emit): Promise<void> {
 
         await context.close();
 
-        // Extract content
+        // Try Readability — good for articles/blogs (high text density)
         const dom = new JSDOM(html, { url: finalUrl });
         const reader = new Readability(dom.window.document.cloneNode(true) as Document);
         const article = reader.parse();
-        const markdown = article
-          ? td.turndown(article.content)
-          : td.turndown(dom.window.document.body?.innerHTML ?? html);
-        const title = article?.title || pageTitle;
-        const wordCount = (article?.textContent ?? '').split(/\s+/).filter(Boolean).length;
+        const articleWordCount = article ? countWords(article.textContent ?? '') : 0;
+
+        let markdown: string;
+        let title: string;
+        let wordCount: number;
+
+        // Use Readability only if it found a substantial article (≥200 words)
+        if (article && articleWordCount >= 200) {
+          markdown = td.turndown(article.content);
+          title = article.title || pageTitle;
+          wordCount = articleWordCount;
+          log(emit, 'info', `Readability extracted ${wordCount} words`);
+        } else {
+          // Full-page extraction: use the clean body HTML from the live rendered DOM
+          markdown = td.turndown(cleanBodyHtml);
+          title = pageTitle;
+          wordCount = countWords(markdown);
+          log(emit, 'info', `Full-page extraction: ${wordCount} words`);
+        }
 
         // Save to disk
         await fs.mkdir(req.outputDir, { recursive: true });
@@ -184,7 +242,10 @@ export async function scrape(req: ScrapeRequest, emit: Emit): Promise<void> {
         await fs.writeFile(savedTo, fileContent, 'utf-8');
 
         if (screenshot) {
-          await fs.writeFile(join(req.outputDir, fileName.replace('.md', '.png')), Buffer.from(screenshot, 'base64'));
+          await fs.writeFile(
+            join(req.outputDir, fileName.replace('.md', '.png')),
+            Buffer.from(screenshot, 'base64'),
+          );
         }
 
         const durationMs = Date.now() - t0;
