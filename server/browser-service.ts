@@ -77,30 +77,23 @@ function countWords(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
-/** Scroll the full page height to trigger lazy-loaded content. */
+/**
+ * Scroll the full page in steps to trigger lazy-loaded content.
+ * Uses multiple simple evaluate calls to avoid the esbuild __name helper
+ * being serialized into the browser context.
+ */
 async function scrollPage(page: import('playwright').Page): Promise<void> {
-  await page.evaluate(() =>
-    new Promise<void>((resolve) => {
-      let scrolled = 0;
-      const step = () => {
-        scrolled += 400;
-        window.scrollTo(0, scrolled);
-        if (scrolled < document.body.scrollHeight) {
-          setTimeout(step, 100);
-        } else {
-          window.scrollTo(0, 0);
-          resolve();
-        }
-      };
-      step();
-    }),
-  );
+  const totalHeight: number = await page.evaluate(() => document.body.scrollHeight);
+  for (let y = 400; y < totalHeight; y += 400) {
+    await page.evaluate((scrollY: number) => window.scrollTo(0, scrollY), y);
+    await sleep(80);
+  }
+  await page.evaluate(() => window.scrollTo(0, 0));
 }
 
 /**
  * Extract clean body HTML from the live rendered DOM.
- * Removes scripts, styles, noscript, iframes and template elements.
- * Returns innerHTML so Turndown can convert it.
+ * Removes noise elements so Turndown produces leaner Markdown.
  */
 async function extractCleanHtml(page: import('playwright').Page): Promise<string> {
   return page.evaluate(() => {
