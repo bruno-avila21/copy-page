@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html { background: #0c0c0c; color: #f0f0f0; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    margin: 0;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #111; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #444; }
+
+  ::selection { background: #312e81; color: #e0e7ff; }
+
+  input, textarea, select {
+    font-family: inherit;
+    font-size: inherit;
+    color: inherit;
+    background: transparent;
+    outline: none;
+  }
+
+  input:-webkit-autofill {
+    -webkit-box-shadow: 0 0 0 40px #1f1f1f inset;
+    -webkit-text-fill-color: #f0f0f0;
+  }
+}
+
+@layer components {
+  .field {
+    @apply w-full bg-bg-elevated border border-border rounded-lg px-3 py-2.5
+           text-text placeholder-text-subtle
+           focus:border-primary focus:ring-1 focus:ring-primary/30
+           transition-all duration-150;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2
+           bg-primary hover:bg-primary-hover
+           text-white font-medium text-sm
+           px-5 py-2.5 rounded-lg
+           transition-all duration-150
+           disabled:opacity-40 disabled:cursor-not-allowed
+           active:scale-[0.98];
+  }
+
+  .card {
+    @apply bg-bg-surface border border-border-subtle rounded-xl p-5;
+  }
+
+  .label {
+    @apply text-xs font-medium text-text-muted uppercase tracking-widest mb-1.5 block;
+  }
+
+  .log-line-info  { @apply text-text-muted; }
+  .log-line-warn  { @apply text-warning; }
+  .log-line-error { @apply text-error; }
+}
