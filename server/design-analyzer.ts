@@ -92,6 +92,39 @@ interface SectionToken {
   tag: string;
   bg: string;
   padding: string;
+  backgroundImage: string;
+  minHeight: string;
+}
+
+interface NavToken {
+  bgColor: string;
+  height: string;
+  logoSrc: string;
+  logoAlt: string;
+  logoPosition: string; // 'left' | 'center' | 'right'
+  navItems: string[];
+  hasTopbar: boolean;
+  topbarBg: string;
+  topbarLayout: string; // css justify-content of topbar
+  topbarItems: Array<{ type: string; text: string; href: string }>;
+}
+
+interface HeroToken {
+  backgroundImageUrl: string;
+  height: string;
+  isFullViewport: boolean;
+  headlineText: string;
+  subtitleText: string;
+  overlayColor: string;
+  selector: string;
+}
+
+interface BgImageToken {
+  selector: string;
+  url: string;
+  width: number;
+  height: number;
+  isHero: boolean;
 }
 
 interface DesignTokens {
@@ -102,6 +135,9 @@ interface DesignTokens {
   shadows: string[];
   radii: string[];
   sections: SectionToken[];
+  nav: NavToken | null;
+  hero: HeroToken | null;
+  backgroundImages: BgImageToken[];
   meta: { title: string; description: string; ogImage: string };
 }
 
@@ -162,11 +198,13 @@ async function extractDesignTokens(page: import('playwright').Page): Promise<Des
       const tag = el.tagName.toLowerCase();
       for (const val of props) {
         if (!val || val === 'transparent' || val === 'rgba(0, 0, 0, 0)') continue;
-        const key = val;
-        if (!colorMap[key]) colorMap[key] = { count: 0, usages: [] };
-        (colorMap[key] as { count: number; usages: string[] }).count += 1;
-        if ((colorMap[key] as { count: number; usages: string[] }).usages.length < 3 && !((colorMap[key] as { count: number; usages: string[] }).usages.includes(tag))) {
-          (colorMap[key] as { count: number; usages: string[] }).usages.push(tag);
+        if (!colorMap[val]) colorMap[val] = { count: 0, usages: [] };
+        (colorMap[val] as { count: number; usages: string[] }).count += 1;
+        if (
+          (colorMap[val] as { count: number; usages: string[] }).usages.length < 3 &&
+          !(colorMap[val] as { count: number; usages: string[] }).usages.includes(tag)
+        ) {
+          (colorMap[val] as { count: number; usages: string[] }).usages.push(tag);
         }
       }
     }
@@ -182,7 +220,6 @@ async function extractDesignTokens(page: import('playwright').Page): Promise<Des
     .sort((a, b) => b.count - a.count)
     .slice(0, 20);
 
-  // Deduplicate by hex
   const seenHex = new Set<string>();
   const dedupColors = colors.filter((c) => {
     if (seenHex.has(c.hex)) return false;
@@ -258,7 +295,6 @@ async function extractDesignTokens(page: import('playwright').Page): Promise<Des
     });
   });
 
-  // Deduplicate buttons by bg+radius combo
   const seenBtn = new Set<string>();
   const buttons: ButtonToken[] = rawButtons.filter((b) => {
     const key = `${b.bg}|${b.radius}`;
@@ -305,18 +341,181 @@ async function extractDesignTokens(page: import('playwright').Page): Promise<Des
     return true;
   }).slice(0, 12);
 
-  // --- sections ---
+  // --- sections (with background-image) ---
   const sections: SectionToken[] = await page.evaluate(() => {
     const tags = ['nav', 'header', 'main', 'section', 'footer'];
-    const result: Array<{ tag: string; bg: string; padding: string }> = [];
+    const result: Array<{ tag: string; bg: string; padding: string; backgroundImage: string; minHeight: string }> = [];
     for (const tag of tags) {
       const el = document.querySelector(tag);
       if (!el) continue;
       const s = window.getComputedStyle(el);
-      result.push({ tag, bg: s.backgroundColor, padding: s.padding });
+      const bgImg = s.backgroundImage;
+      const bgUrl = (bgImg && bgImg !== 'none')
+        ? (bgImg.match(/url\(["']?([^"')]+)["']?\)/)?.[1] ?? '')
+        : '';
+      result.push({
+        tag,
+        bg: s.backgroundColor,
+        padding: s.padding,
+        backgroundImage: bgUrl,
+        minHeight: s.minHeight,
+      });
     }
     return result;
   });
+
+  // --- background images (find all CSS bg images, largest area first) ---
+  const rawBgImages = await page.evaluate(() => {
+    const result: Array<{ selector: string; url: string; width: number; height: number }> = [];
+    const els = Array.from(document.querySelectorAll('section, header, div, article, main, figure')).slice(0, 300);
+    for (const el of els) {
+      const s = window.getComputedStyle(el);
+      const bg = s.backgroundImage;
+      if (!bg || bg === 'none') continue;
+      const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
+      if (!match) continue;
+      const url = match[1] ?? '';
+      if (!url || url.startsWith('data:')) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 100 || rect.height < 50) continue;
+      const id = el.id ? '#' + el.id : '';
+      const cls = el.className && typeof el.className === 'string'
+        ? '.' + el.className.trim().split(/\s+/)[0]
+        : '';
+      result.push({
+        selector: el.tagName.toLowerCase() + id + cls,
+        url,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      });
+    }
+    return result.sort((a, b) => (b.width * b.height) - (a.width * a.height)).slice(0, 8);
+  });
+
+  const viewportH: number = await page.evaluate(() => window.innerHeight);
+  const backgroundImages: BgImageToken[] = rawBgImages.map((img) => ({
+    ...img,
+    isHero: img.height >= viewportH * 0.5,
+  }));
+
+  // --- hero detection ---
+  const rawHero = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll('section, header, div, article')).slice(0, 200);
+    let best: Element | null = null;
+    let bestArea = 0;
+    for (const el of candidates) {
+      const s = window.getComputedStyle(el);
+      if (!s.backgroundImage || s.backgroundImage === 'none') continue;
+      const rect = el.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area > bestArea) {
+        bestArea = area;
+        best = el;
+      }
+    }
+    if (!best) return null;
+    const s = window.getComputedStyle(best);
+    const bgImg = s.backgroundImage;
+    const bgUrl = bgImg.match(/url\(["']?([^"')]+)["']?\)/)?.[1] ?? '';
+    const rect = (best as HTMLElement).getBoundingClientRect();
+    // Find overlay child (first div with semi-transparent bg)
+    let overlayColor = '';
+    for (const child of Array.from((best as HTMLElement).children)) {
+      const cs = window.getComputedStyle(child);
+      if (cs.backgroundColor && cs.backgroundColor !== 'rgba(0, 0, 0, 0)' && cs.backgroundColor.startsWith('rgba')) {
+        overlayColor = cs.backgroundColor;
+        break;
+      }
+    }
+    const heading = (best as HTMLElement).querySelector('h1, h2, h3');
+    const sub = (best as HTMLElement).querySelector('p, h4');
+    const id = (best as HTMLElement).id ? '#' + (best as HTMLElement).id : '';
+    const cls = (best as HTMLElement).className && typeof (best as HTMLElement).className === 'string'
+      ? '.' + (best as HTMLElement).className.trim().split(/\s+/)[0]
+      : '';
+    return {
+      backgroundImageUrl: bgUrl,
+      height: String(Math.round(rect.height)),
+      isFullViewport: rect.height >= window.innerHeight * 0.7,
+      headlineText: (heading?.textContent ?? '').trim().slice(0, 100),
+      subtitleText: (sub?.textContent ?? '').trim().slice(0, 100),
+      overlayColor,
+      selector: (best as HTMLElement).tagName.toLowerCase() + id + cls,
+    };
+  });
+
+  const hero: HeroToken | null = rawHero;
+
+  // --- navigation structure ---
+  const rawNav = await page.evaluate(() => {
+    const navEl = document.querySelector('nav, header');
+    if (!navEl) return null;
+    const s = window.getComputedStyle(navEl);
+
+    // Logo
+    const logoImg = navEl.querySelector('img');
+    const logoSrc = logoImg?.src ?? '';
+    const logoAlt = logoImg?.alt ?? '';
+
+    // Logo position: check if logo link is first or if nav has justify-content center
+    const logoLink = navEl.querySelector('a');
+    const logoRect = logoLink?.getBoundingClientRect();
+    const navRect = navEl.getBoundingClientRect();
+    let logoPosition = 'left';
+    if (logoRect && navRect.width > 0) {
+      const center = logoRect.left - navRect.left + logoRect.width / 2;
+      const rel = center / navRect.width;
+      if (rel > 0.4 && rel < 0.6) logoPosition = 'center';
+      else if (rel > 0.7) logoPosition = 'right';
+    }
+
+    // Nav items (text of direct anchor links)
+    const allLinks = Array.from(navEl.querySelectorAll('a')).slice(0, 15);
+    const navItems = allLinks
+      .map((a) => a.textContent?.trim() ?? '')
+      .filter((t) => t.length > 0 && t.length < 30);
+
+    // Topbar: look for a sibling or preceding small bar
+    const prevEl = navEl.previousElementSibling as HTMLElement | null;
+    let hasTopbar = false;
+    let topbarBg = '';
+    let topbarLayout = '';
+    let topbarItems: Array<{ type: string; text: string; href: string }> = [];
+    if (prevEl) {
+      const ps = window.getComputedStyle(prevEl);
+      const rect = prevEl.getBoundingClientRect();
+      if (rect.height < 60 && rect.height > 0) {
+        hasTopbar = true;
+        topbarBg = ps.backgroundColor;
+        topbarLayout = ps.justifyContent;
+        topbarItems = Array.from(prevEl.querySelectorAll('a, img, span')).slice(0, 12).map((el) => {
+          const tag = el.tagName.toLowerCase();
+          const isImg = tag === 'img';
+          const isLink = tag === 'a';
+          return {
+            type: isImg ? 'image' : isLink ? 'link' : 'text',
+            text: isImg ? (el as HTMLImageElement).alt : (el.textContent?.trim() ?? ''),
+            href: isLink ? (el as HTMLAnchorElement).href : '',
+          };
+        });
+      }
+    }
+
+    return {
+      bgColor: s.backgroundColor,
+      height: s.height,
+      logoSrc,
+      logoAlt,
+      logoPosition,
+      navItems: [...new Set(navItems)].slice(0, 10),
+      hasTopbar,
+      topbarBg,
+      topbarLayout,
+      topbarItems,
+    };
+  });
+
+  const nav: NavToken | null = rawNav;
 
   // --- meta ---
   const meta = await page.evaluate(() => ({
@@ -336,6 +535,9 @@ async function extractDesignTokens(page: import('playwright').Page): Promise<Des
     shadows,
     radii,
     sections,
+    nav,
+    hero,
+    backgroundImages,
     meta,
   };
 }
@@ -464,12 +666,29 @@ ${headingTable || '| H1–H6 | (not detected) | — | — | — | — |'}
 - Border: \`${b.border}\``;
   }).join('\n\n');
 
-  const navSection = tokens.sections.find((s) => s.tag === 'nav' || s.tag === 'header');
-  const navBgHex = navSection ? (rgbToHex(navSection.bg) ?? navSection.bg) : 'not detected';
+  // Nav structure
+  const navBgHex = tokens.nav
+    ? (rgbToHex(tokens.nav.bgColor) ?? tokens.nav.bgColor)
+    : (tokens.sections.find((s) => s.tag === 'nav' || s.tag === 'header') ?? tokens.sections[0])
+      ? (rgbToHex((tokens.sections.find((s) => s.tag === 'nav' || s.tag === 'header') ?? tokens.sections[0])!.bg) ?? '')
+      : 'not detected';
+
+  const navDetail = tokens.nav ? `
+- Background: \`${navBgHex}\`
+- Height: \`${tokens.nav.height}\`
+- Logo: \`${tokens.nav.logoSrc || 'not detected'}\` (alt: "${tokens.nav.logoAlt}") — position: **${tokens.nav.logoPosition}**
+- Nav links: ${tokens.nav.navItems.map((i) => `\`${i}\``).join(', ') || '(none detected)'}
+${tokens.nav.hasTopbar ? `
+**Topbar (utility bar above nav):**
+- Background: \`${rgbToHex(tokens.nav.topbarBg) ?? tokens.nav.topbarBg}\`
+- Layout (justify-content): \`${tokens.nav.topbarLayout}\`
+- Items: ${tokens.nav.topbarItems.map((item) => `${item.type}(${item.text || item.href.slice(0, 40)})`).join(', ')}` : '- No topbar detected above nav'}` : `\n- Background: \`${navBgHex}\``;
 
   const sectionsList = tokens.sections.map((s) => {
     const bgHex = rgbToHex(s.bg) ?? s.bg;
-    return `- **\`<${s.tag}>\`**: background \`${bgHex}\`, padding \`${s.padding}\``;
+    const bgImg = s.backgroundImage ? `\n  - background-image: \`${s.backgroundImage}\`` : '';
+    const minH = s.minHeight && s.minHeight !== '0px' ? `\n  - min-height: \`${s.minHeight}\`` : '';
+    return `- **\`<${s.tag}>\`**: background \`${bgHex}\`, padding \`${s.padding}\`${bgImg}${minH}`;
   }).join('\n');
 
   const components = `## 4. Component Stylings
@@ -479,13 +698,29 @@ ${headingTable || '| H1–H6 | (not detected) | — | — | — | — |'}
 ${buttonsList || '_(No distinct button styles detected)_'}
 
 ### Navigation
-
-- Background: \`${navBgHex}\`
-${navSection ? `- Padding: \`${navSection.padding}\`` : ''}
+${navDetail}
 
 ### Page Sections
 
 ${sectionsList || '_(No landmark sections detected)_'}`;
+
+  // ── Section 4b: Hero & Background Images ─────────────────────────────────
+  const heroSection = tokens.hero ? `## 4b. Hero Section
+
+- **Selector**: \`${tokens.hero.selector}\`
+- **Background image**: \`${tokens.hero.backgroundImageUrl}\`
+- **Height**: ${tokens.hero.height}px ${tokens.hero.isFullViewport ? '(full viewport)' : ''}
+- **Overlay color**: \`${tokens.hero.overlayColor || 'none detected'}\`
+- **Headline**: "${tokens.hero.headlineText}"
+- **Subtitle**: "${tokens.hero.subtitleText}"
+
+> When replicating: use \`background-image: url('${tokens.hero.backgroundImageUrl}')\` on the hero container. Apply the overlay as a pseudo-element or child div with \`background: ${tokens.hero.overlayColor || 'rgba(0,0,0,0.4)'}\`.` : '';
+
+  const bgImagesSection = tokens.backgroundImages.length > 0 ? `## 4c. All Background Images
+
+| Selector | Image URL | Size |
+|----------|-----------|------|
+${tokens.backgroundImages.map((img) => `| \`${img.selector}\` | \`${img.url}\` | ${img.width}×${img.height}px${img.isHero ? ' ⭐ hero' : ''} |`).join('\n')}` : '';
 
   // ── Section 5: Layout ─────────────────────────────────────────────────────
   const radiiTable = tokens.radii.slice(0, 8).map((r) => `| \`${r}\` | detected from computed styles |`).join('\n');
@@ -574,10 +809,12 @@ font-family: ${fontStack};
 
 1. Start with the color variables block above — assign semantic roles (primary, bg, text, border, accent)
 2. Set the font stack as your base body font; adjust weights to match the hierarchy table in section 3
-3. Build the primary CTA button first — it establishes the interactive grammar
-4. Use the border-radius values from section 5 consistently; avoid mixing grammars
-5. Reproduce the section-level padding from the layout principles to recreate the spatial rhythm
-6. ${tokens.shadows.length === 0 ? 'Use surface color changes (not shadows) for elevation, as the original does' : 'Apply shadows from section 6 only at the same elevation levels as the original'}`;
+3. ${tokens.hero ? `Hero section uses \`background-image: url('${tokens.hero.backgroundImageUrl}')\` — DO NOT use an \`<img>\` tag; it must be a CSS background so the text overlays correctly` : 'Identify full-viewport background images — replicate them as CSS background-image, not <img> tags'}
+4. ${tokens.nav?.hasTopbar ? `There are TWO nav zones: a topbar (background \`${rgbToHex(tokens.nav.topbarBg) ?? tokens.nav.topbarBg}\`) above the main navbar (background \`${navBgHex}\`) — build them as separate elements` : 'Navigation is a single bar — match the background and height exactly'}
+5. ${tokens.nav ? `Logo (${tokens.nav.logoSrc}) is positioned **${tokens.nav.logoPosition}** in the nav — set the flex container's alignment accordingly` : 'Match the logo position in the navigation bar'}
+6. Build the primary CTA button first — it establishes the interactive grammar
+7. Use the border-radius values from section 5 consistently; avoid mixing grammars
+8. ${tokens.shadows.length === 0 ? 'Use surface color changes (not shadows) for elevation, as the original does' : 'Apply shadows from section 6 only at the same elevation levels as the original'}`;
 
   // ── Screenshots reference ─────────────────────────────────────────────────
   const screenshotRef = [
@@ -597,11 +834,13 @@ font-family: ${fontStack};
     colorPalette,
     typography,
     components,
+    heroSection || null,
+    bgImagesSection || null,
     layout,
     depth,
     agentGuide,
     screenshotSection,
-  ].join('\n\n');
+  ].filter(Boolean).join('\n\n');
 }
 
 // ── main export ───────────────────────────────────────────────────────────────
