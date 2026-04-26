@@ -4,3 +4,6 @@ dist-server/
 .sessions/
 *.local
 .env
+
+# Scraped output files — these are user data, not source code
+src/pages/
