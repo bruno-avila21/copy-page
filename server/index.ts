@@ -87,21 +87,19 @@ app.get('/api/events/:taskId', (req, res) => {
   }
   bus.sseConnected = true;
 
-  if (bus.done) {
-    res.end();
-    return;
-  }
+  // If already done, all events were flushed above — client will close on its own
+  if (bus.done) return;
 
   // Forward live events directly — no buffer check needed
   const onEvent = (ev: ScrapeEvent): void => { send(ev); };
-  const onDone  = (): void => { res.end(); };
 
   bus.emitter.on('event', onEvent);
-  bus.emitter.once('done', onDone);
 
+  // Never call res.end() from the server — the client calls es.close() after
+  // receiving result/error, which closes the TCP connection cleanly.
+  // This prevents the FIN arriving before onmessage fires in the browser.
   req.on('close', () => {
     bus.emitter.off('event', onEvent);
-    bus.emitter.off('done', onDone);
   });
 });
 
