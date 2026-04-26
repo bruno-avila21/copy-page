@@ -26,4 +26,17 @@ export interface ScrapeFormValues {
   timeout: number;
   screenshot: boolean;
   sessionId: string;
+  mode: 'extract' | 'analyze';
+}
+
+export interface AnalyzeResult {
+  url: string;
+  finalUrl: string;
+  title: string;
+  designMd: string;
+  designMdPath: string;
+  screenshots: { desktop?: string; tablet?: string; mobile?: string };
+  screenshotPaths: { desktop?: string; tablet?: string; mobile?: string };
+  durationMs: number;
+  botDetected: boolean;
 }

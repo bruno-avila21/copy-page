@@ -2,7 +2,8 @@ import { useState, useCallback, useId } from 'react';
 import { StatusBadge } from './components/StatusBadge.js';
 import { LogViewer } from './components/LogViewer.js';
 import { MarkdownPreview } from './components/MarkdownPreview.js';
-import type { AppStatus, LogEntry, ScrapeResult, ScrapeFormValues } from './types.js';
+import { AnalyzePreview } from './components/AnalyzePreview.js';
+import type { AppStatus, LogEntry, ScrapeResult, ScrapeFormValues, AnalyzeResult } from './types.js';
 
 // SSE must connect directly — Vite's proxy buffers streaming responses
 const SERVER = import.meta.env.DEV ? 'http://localhost:3001' : '';
@@ -18,6 +19,7 @@ const DEFAULT_FORM: ScrapeFormValues = {
   timeout: 30000,
   screenshot: false,
   sessionId: '',
+  mode: 'extract',
 };
 
 export default function App() {
@@ -26,6 +28,7 @@ export default function App() {
   const [status, setStatus] = useState<AppStatus>('idle');
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [result, setResult] = useState<ScrapeResult | null>(null);
+  const [analyzeResult, setAnalyzeResult] = useState<AnalyzeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const addLog = useCallback((level: LogEntry['level'], message: string) => {
@@ -43,11 +46,15 @@ export default function App() {
       setStatus('loading');
       setLogs([]);
       setResult(null);
+      setAnalyzeResult(null);
       setError(null);
+
+      const isAnalyze = form.mode === 'analyze';
+      const endpoint = isAnalyze ? '/api/analyze' : '/api/scrape';
 
       try {
         // Create task
-        const res = await fetch('/api/scrape', {
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -55,7 +62,7 @@ export default function App() {
             outputDir: form.outputDir.trim(),
             waitFor: form.waitFor || 'networkidle',
             timeout: form.timeout,
-            screenshot: form.screenshot,
+            ...(isAnalyze ? {} : { screenshot: form.screenshot }),
             sessionId: form.sessionId.trim() || undefined,
           }),
         });
@@ -80,13 +87,18 @@ export default function App() {
               const pr = await fetch(`${SERVER}/api/result/${taskId}`);
               if (pr.status === 202) continue; // still pending
               if (!pr.ok) break;
-              const payload = await pr.json() as ScrapeResult | { error: string };
+              const payload = await pr.json() as ScrapeResult | AnalyzeResult | { error: string };
               if ('error' in payload) {
-                setError(payload.error);
+                setError((payload as { error: string }).error);
                 setStatus('error');
+              } else if ('designMd' in payload) {
+                const r = payload as AnalyzeResult;
+                setAnalyzeResult(r);
+                setStatus(r.botDetected ? 'bot-blocked' : 'success');
               } else {
-                setResult(payload);
-                setStatus(payload.botDetected ? 'bot-blocked' : 'success');
+                const r = payload as ScrapeResult;
+                setResult(r);
+                setStatus(r.botDetected ? 'bot-blocked' : 'success');
               }
               resolved = true;
             } catch { /* network error, keep retrying */ }
@@ -100,19 +112,30 @@ export default function App() {
 
         es.onmessage = (ev) => {
           const event = JSON.parse(ev.data as string) as {
-            type: 'log' | 'result' | 'error';
+            type: 'log' | 'result' | 'analyze-result' | 'error';
             level?: LogEntry['level'];
             message?: string;
-            data?: ScrapeResult;
+            data?: ScrapeResult | AnalyzeResult;
             error?: string;
           };
 
           if (event.type === 'log') {
             addLog(event.level ?? 'info', event.message ?? '');
+            // Race-condition fix: if save confirmation arrived but result event is delayed,
+            // poll after 1200ms to unblock the UI
+            if (event.message?.startsWith('✓')) {
+              setTimeout(() => { if (!resolved) void pollResult(); }, 1200);
+            }
           } else if (event.type === 'result' && event.data) {
             resolved = true;
-            const r = event.data;
+            const r = event.data as ScrapeResult;
             setResult(r);
+            setStatus(r.botDetected ? 'bot-blocked' : 'success');
+            es.close();
+          } else if (event.type === 'analyze-result' && event.data) {
+            resolved = true;
+            const r = event.data as AnalyzeResult;
+            setAnalyzeResult(r);
             setStatus(r.botDetected ? 'bot-blocked' : 'success');
             es.close();
           } else if (event.type === 'error') {
@@ -157,6 +180,41 @@ export default function App() {
       <main className="max-w-3xl mx-auto px-4 py-8 flex flex-col gap-6">
         {/* Input card */}
         <form id={formId} onSubmit={handleSubmit} className="card flex flex-col gap-5">
+          {/* Mode toggle */}
+          <div>
+            <label className="label">Mode</label>
+            <div className="flex gap-2 mt-1">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={form.mode === 'extract'}
+                className={`h-9 px-4 rounded-lg border text-sm font-medium transition-all duration-150
+                  ${form.mode === 'extract'
+                    ? 'bg-primary/20 border-primary/50 text-primary'
+                    : 'bg-bg-elevated border-border text-text-subtle'
+                  }`}
+                onClick={() => setForm((f) => ({ ...f, mode: 'extract' }))}
+                disabled={isRunning}
+              >
+                Extract Content
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={form.mode === 'analyze'}
+                className={`h-9 px-4 rounded-lg border text-sm font-medium transition-all duration-150
+                  ${form.mode === 'analyze'
+                    ? 'bg-primary/20 border-primary/50 text-primary'
+                    : 'bg-bg-elevated border-border text-text-subtle'
+                  }`}
+                onClick={() => setForm((f) => ({ ...f, mode: 'analyze' }))}
+                disabled={isRunning}
+              >
+                Analyze Design
+              </button>
+            </div>
+          </div>
+
           {/* URL */}
           <div>
             <label className="label" htmlFor="url">Page URL</label>
@@ -232,23 +290,25 @@ export default function App() {
               />
             </div>
 
-            <div className="flex flex-col justify-end">
-              <label className="label">Screenshot</label>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={form.screenshot}
-                className={`h-9 px-3 rounded-lg border text-sm font-medium transition-all duration-150
-                  ${form.screenshot
-                    ? 'bg-primary/20 border-primary/50 text-primary'
-                    : 'bg-bg-elevated border-border text-text-subtle'
-                  }`}
-                onClick={() => setForm((f) => ({ ...f, screenshot: !f.screenshot }))}
-                disabled={isRunning}
-              >
-                {form.screenshot ? 'On' : 'Off'}
-              </button>
-            </div>
+            {form.mode === 'extract' && (
+              <div className="flex flex-col justify-end">
+                <label className="label">Screenshot</label>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={form.screenshot}
+                  className={`h-9 px-3 rounded-lg border text-sm font-medium transition-all duration-150
+                    ${form.screenshot
+                      ? 'bg-primary/20 border-primary/50 text-primary'
+                      : 'bg-bg-elevated border-border text-text-subtle'
+                    }`}
+                  onClick={() => setForm((f) => ({ ...f, screenshot: !f.screenshot }))}
+                  disabled={isRunning}
+                >
+                  {form.screenshot ? 'On' : 'Off'}
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Submit */}
@@ -256,8 +316,10 @@ export default function App() {
             {isRunning ? (
               <>
                 <span className="inline-block w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Extracting…
+                {form.mode === 'analyze' ? 'Analyzing…' : 'Extracting…'}
               </>
+            ) : form.mode === 'analyze' ? (
+              <><span className="text-gold">◆</span> Analyze Design</>
             ) : (
               <><span className="text-gold">◆</span> Extract Page</>
             )}
@@ -270,7 +332,9 @@ export default function App() {
         {/* Error state */}
         {status === 'error' && error && (
           <div className="card border-error/30 animate-fade-in">
-            <p className="text-xs font-medium text-error mb-1">Extraction failed</p>
+            <p className="text-xs font-medium text-error mb-1">
+              {form.mode === 'analyze' ? 'Analysis failed' : 'Extraction failed'}
+            </p>
             <p className="text-sm text-text-muted font-mono">{error}</p>
             <p className="text-xs text-text-subtle mt-3">
               If you see &quot;Bot challenge&quot; in the logs, try adding a proxy or
@@ -280,7 +344,7 @@ export default function App() {
         )}
 
         {/* Bot-blocked banner */}
-        {status === 'bot-blocked' && result && (
+        {status === 'bot-blocked' && (result ?? analyzeResult) && (
           <div className="card border-warning/30 animate-fade-in">
             <p className="text-xs font-medium text-warning mb-1">
               ⚠ Bot detection triggered — content may be partial
@@ -294,6 +358,7 @@ export default function App() {
 
         {/* Result preview */}
         {result && <MarkdownPreview result={result} />}
+        {analyzeResult && <AnalyzePreview result={analyzeResult} />}
       </main>
     </div>
   );

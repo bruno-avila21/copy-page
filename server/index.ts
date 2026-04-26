@@ -3,20 +3,24 @@ import cors from 'cors';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { scrape, type ScrapeRequest, type ScrapeEvent, type ScrapeResult } from './browser-service.js';
+import { analyzeDesign, type AnalyzeRequest, type AnalyzeEvent } from './design-analyzer.js';
+import type { AnalyzeResult } from '../src/types.js';
 
 const app = express();
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:4173'] }));
 app.use(express.json());
 
+type AnyEvent = ScrapeEvent | AnalyzeEvent;
+
 interface TaskBus {
   emitter: EventEmitter;
   /** Events emitted before an SSE client connected — flushed on connect */
-  preBuffer: ScrapeEvent[];
+  preBuffer: AnyEvent[];
   /** True once an SSE client has connected */
   sseConnected: boolean;
   done: boolean;
   /** Cached final result so /api/result can serve it without SSE */
-  cachedResult?: ScrapeResult | { error: string };
+  cachedResult?: ScrapeResult | AnalyzeResult | { error: string };
 }
 
 const tasks = new Map<string, TaskBus>();
@@ -82,6 +86,36 @@ app.get('/api/result/:taskId', (req, res) => {
   res.json(bus.cachedResult);
 });
 
+// POST /api/analyze — starts design analysis job, returns taskId immediately
+app.post('/api/analyze', (req, res) => {
+  const body = req.body as AnalyzeRequest;
+  if (!body.url || !body.outputDir) {
+    res.status(400).json({ error: 'url and outputDir are required' });
+    return;
+  }
+
+  const taskId = randomUUID();
+  const bus = getOrCreate(taskId);
+  res.json({ taskId });
+
+  const emit = (event: AnalyzeEvent): void => {
+    if (!bus.sseConnected) {
+      bus.preBuffer.push(event);
+    }
+    bus.emitter.emit('event', event);
+    if (event.type === 'analyze-result' || event.type === 'error') {
+      if (event.type === 'analyze-result' && event.data) bus.cachedResult = event.data;
+      if (event.type === 'error') bus.cachedResult = { error: event.error ?? 'Unknown error' };
+      bus.done = true;
+      bus.emitter.emit('done');
+    }
+  };
+
+  analyzeDesign(body, emit).catch((err: unknown) => {
+    emit({ type: 'error', error: err instanceof Error ? err.message : String(err) });
+  });
+});
+
 // GET /api/events/:taskId — SSE stream
 app.get('/api/events/:taskId', (req, res) => {
   const { taskId } = req.params as { taskId: string };
@@ -95,7 +129,7 @@ app.get('/api/events/:taskId', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const send = (event: ScrapeEvent): void => {
+  const send = (event: AnyEvent): void => {
     res.write(`data: ${JSON.stringify(event)}\n\n`);
   };
 
@@ -111,7 +145,7 @@ app.get('/api/events/:taskId', (req, res) => {
   if (bus.done) return;
 
   // Forward live events directly — no buffer check needed
-  const onEvent = (ev: ScrapeEvent): void => { send(ev); };
+  const onEvent = (ev: AnyEvent): void => { send(ev); };
 
   bus.emitter.on('event', onEvent);
 
