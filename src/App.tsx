@@ -4,6 +4,9 @@ import { LogViewer } from './components/LogViewer.js';
 import { MarkdownPreview } from './components/MarkdownPreview.js';
 import type { AppStatus, LogEntry, ScrapeResult, ScrapeFormValues } from './types.js';
 
+// SSE must connect directly — Vite's proxy buffers streaming responses
+const SERVER = import.meta.env.DEV ? 'http://localhost:3001' : '';
+
 function randomId() {
   return Math.random().toString(36).slice(2);
 }
@@ -64,8 +67,8 @@ export default function App() {
 
         const { taskId } = (await res.json()) as { taskId: string };
 
-        // Open SSE stream
-        const es = new EventSource(`/api/events/${taskId}`);
+        // Open SSE stream — direct to server, bypasses Vite proxy buffering
+        const es = new EventSource(`${SERVER}/api/events/${taskId}`);
         // Flag: we handled termination via a message — onerror after this is just server-side res.end()
         let resolved = false;
 

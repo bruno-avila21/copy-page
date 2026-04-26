@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events';
 import { scrape, type ScrapeRequest, type ScrapeEvent } from './browser-service.js';
 
 const app = express();
-app.use(cors({ origin: 'http://localhost:5173' }));
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:4173'] }));
 app.use(express.json());
 
 // Per-task event bus: taskId → emitter
@@ -65,6 +65,7 @@ app.get('/api/events/:taskId', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable Nginx / proxy buffering
   res.flushHeaders();
 
   const send = (event: ScrapeEvent): void => {
