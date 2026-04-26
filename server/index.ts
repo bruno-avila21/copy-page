@@ -8,11 +8,12 @@ const app = express();
 app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:4173'] }));
 app.use(express.json());
 
-// Per-task event bus: taskId → emitter
-// Events are buffered until the SSE client connects, then flushed.
 interface TaskBus {
   emitter: EventEmitter;
-  buffer: ScrapeEvent[];
+  /** Events emitted before an SSE client connected — flushed on connect */
+  preBuffer: ScrapeEvent[];
+  /** True once an SSE client has connected — new events go directly to emitter */
+  sseConnected: boolean;
   done: boolean;
 }
 
@@ -21,9 +22,13 @@ const tasks = new Map<string, TaskBus>();
 function getOrCreate(taskId: string): TaskBus {
   const existing = tasks.get(taskId);
   if (existing) return existing;
-  const bus: TaskBus = { emitter: new EventEmitter(), buffer: [], done: false };
+  const bus: TaskBus = {
+    emitter: new EventEmitter(),
+    preBuffer: [],
+    sseConnected: false,
+    done: false,
+  };
   tasks.set(taskId, bus);
-  // Auto-clean 5 min after task completes
   bus.emitter.once('done', () => {
     setTimeout(() => tasks.delete(taskId), 5 * 60_000);
   });
@@ -40,11 +45,14 @@ app.post('/api/scrape', (req, res) => {
 
   const taskId = randomUUID();
   const bus = getOrCreate(taskId);
-
   res.json({ taskId });
 
   const emit = (event: ScrapeEvent): void => {
-    bus.buffer.push(event);
+    if (!bus.sseConnected) {
+      // SSE client not yet connected — buffer the event
+      bus.preBuffer.push(event);
+    }
+    // Always emit so live SSE listeners receive it
     bus.emitter.emit('event', event);
     if (event.type === 'result' || event.type === 'error') {
       bus.done = true;
@@ -53,8 +61,7 @@ app.post('/api/scrape', (req, res) => {
   };
 
   scrape(body, emit).catch((err: unknown) => {
-    const error = err instanceof Error ? err.message : String(err);
-    emit({ type: 'error', error });
+    emit({ type: 'error', error: err instanceof Error ? err.message : String(err) });
   });
 });
 
@@ -65,7 +72,7 @@ app.get('/api/events/:taskId', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable Nginx / proxy buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const send = (event: ScrapeEvent): void => {
@@ -74,23 +81,20 @@ app.get('/api/events/:taskId', (req, res) => {
 
   const bus = getOrCreate(taskId);
 
-  // Flush already-buffered events
-  for (const ev of bus.buffer) {
+  // Flush events that arrived before this SSE connection
+  for (const ev of bus.preBuffer) {
     send(ev);
   }
+  bus.sseConnected = true;
 
   if (bus.done) {
     res.end();
     return;
   }
 
-  // Subscribe to future events
-  const onEvent = (ev: ScrapeEvent): void => {
-    // Skip events already flushed from buffer
-    if (bus.buffer.includes(ev)) return;
-    send(ev);
-  };
-  const onDone = (): void => { res.end(); };
+  // Forward live events directly — no buffer check needed
+  const onEvent = (ev: ScrapeEvent): void => { send(ev); };
+  const onDone  = (): void => { res.end(); };
 
   bus.emitter.on('event', onEvent);
   bus.emitter.once('done', onDone);
@@ -101,7 +105,6 @@ app.get('/api/events/:taskId', (req, res) => {
   });
 });
 
-// Health check
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', version: '0.1.0' });
 });
@@ -114,9 +117,13 @@ const server = app.listen(PORT, () => {
 server.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`\n✕ Port ${PORT} already in use.`);
-    console.error(`  Kill it: Get-Process -Id (Get-NetTCPConnection -LocalPort ${PORT}).OwningProcess | Stop-Process -Force\n`);
+    console.error(`  Fix: Get-Process -Id (Get-NetTCPConnection -LocalPort ${PORT}).OwningProcess | Stop-Process -Force\n`);
   } else {
     console.error(err);
   }
   process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
 });
